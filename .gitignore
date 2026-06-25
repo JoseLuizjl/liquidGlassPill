@@ -1,0 +1,31 @@
+# Build output
+build/
+out/
+bin/
+obj/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Compiled binaries and objects
+*.exe
+*.dll
+*.lib
+*.a
+*.obj
+*.o
+*.pdb
+
+# Generated shader binaries
+*.spv
+
+# Local editor and OS files
+.vscode/
+.vs/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
