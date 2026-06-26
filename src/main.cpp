@@ -1,6 +1,8 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
 #include <windowsx.h>
+#include <objbase.h>
+#include <wincodec.h>
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
@@ -21,22 +23,16 @@ namespace {
 constexpr int kInitialWidth = 960;
 constexpr int kInitialHeight = 640;
 constexpr int kMaxFramesInFlight = 2;
-constexpr int kBackgroundWidth = 1280;
-constexpr int kBackgroundHeight = 720;
-constexpr float kPillTransitionResponsiveness = 11.5f;
+constexpr float kPillTransitionResponsiveness = 9.25f;
 constexpr float kPillTransitionSnapEpsilon = 0.35f;
-constexpr float kGooDecayResponsiveness = 5.25f;
+constexpr float kGooDecayResponsiveness = 3.85f;
 constexpr float kGooSnapEpsilon = 0.015f;
+constexpr wchar_t kBackgroundImagePath[] = L"C:\\Users\\jluiz\\Desktop\\Newspaper.png";
 
-struct CpuColor {
-    float r;
-    float g;
-    float b;
-};
-
-struct CpuVec2 {
-    float x;
-    float y;
+struct ImagePixels {
+    std::vector<std::uint8_t> rgba;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
 };
 
 struct PushConstants {
@@ -153,157 +149,6 @@ float Lerp(float a, float b, float t) {
     return a + (b - a) * t;
 }
 
-float CpuHash(float x, float y) {
-    float v = std::fmod(std::sin(x * 127.1f + y * 311.7f) * 43758.5453f, 1.0f);
-    return v < 0.0f ? v + 1.0f : v;
-}
-
-float CpuNoise(float x, float y) {
-    const float ix = std::floor(x);
-    const float iy = std::floor(y);
-    float fx = x - ix;
-    float fy = y - iy;
-    fx = fx * fx * (3.0f - 2.0f * fx);
-    fy = fy * fy * (3.0f - 2.0f * fy);
-    const float a = CpuHash(ix, iy);
-    const float b = CpuHash(ix + 1.0f, iy);
-    const float c = CpuHash(ix, iy + 1.0f);
-    const float d = CpuHash(ix + 1.0f, iy + 1.0f);
-    const float x1 = a + (b - a) * fx;
-    const float x2 = c + (d - c) * fx;
-    return x1 + (x2 - x1) * fy;
-}
-
-float CpuFbm(float x, float y) {
-    float value = 0.0f;
-    float amplitude = 0.55f;
-    for (int i = 0; i < 4; ++i) {
-        value += amplitude * CpuNoise(x, y);
-        const float nx = x * 1.68f - y * 0.46f + 8.31f;
-        const float ny = x * 0.46f + y * 1.68f + 3.17f;
-        x = nx;
-        y = ny;
-        amplitude *= 0.50f;
-    }
-    return value;
-}
-
-CpuColor Mix(CpuColor a, CpuColor b, float t) {
-    t = Clamp01(t);
-    return {
-        a.r + (b.r - a.r) * t,
-        a.g + (b.g - a.g) * t,
-        a.b + (b.b - a.b) * t,
-    };
-}
-
-CpuColor Add(CpuColor color, CpuColor amount, float strength = 1.0f) {
-    return {
-        color.r + amount.r * strength,
-        color.g + amount.g * strength,
-        color.b + amount.b * strength,
-    };
-}
-
-CpuColor Mul(CpuColor color, float strength) {
-    return {color.r * strength, color.g * strength, color.b * strength};
-}
-
-float SoftCircle(CpuVec2 p, CpuVec2 center, float radius, float blur) {
-    const float dx = p.x - center.x;
-    const float dy = p.y - center.y;
-    return 1.0f - SmoothStep(radius - blur, radius + blur, std::sqrt(dx * dx + dy * dy));
-}
-
-CpuVec2 Rotate(CpuVec2 p, float angle) {
-    const float s = std::sin(angle);
-    const float c = std::cos(angle);
-    return {p.x * c - p.y * s, p.x * s + p.y * c};
-}
-
-float SoftEllipse(CpuVec2 p, CpuVec2 center, CpuVec2 radius, float angle, float blur) {
-    const CpuVec2 q = Rotate({p.x - center.x, p.y - center.y}, angle);
-    const float e = std::sqrt((q.x / radius.x) * (q.x / radius.x) + (q.y / radius.y) * (q.y / radius.y));
-    return 1.0f - SmoothStep(1.0f - blur, 1.0f + blur, e);
-}
-
-CpuColor DrawLeaf(CpuColor color, CpuVec2 uv, CpuVec2 center, float scale, float angle, CpuColor leafColor) {
-    const float leaf = SoftEllipse(uv, center, {scale * 0.075f, scale * 0.235f}, angle, 0.18f);
-    const CpuVec2 q = Rotate({uv.x - center.x, uv.y - center.y}, angle);
-    const float vein = leaf * (1.0f - SmoothStep(0.0f, 0.010f, std::fabs(q.x + std::sin(q.y * 42.0f) * 0.003f)));
-    const float rib = leaf * (0.5f + 0.5f * std::sin(q.y * 75.0f + q.x * 24.0f));
-    color = Mix(color, Mul(leafColor, 0.80f + rib * 0.24f), leaf * 0.88f);
-    return Add(color, {0.24f, 0.36f, 0.31f}, vein);
-}
-
-float FlowerPetals(CpuVec2 uv, CpuVec2 center, float scale, float phase) {
-    float petals = 0.0f;
-    for (int i = 0; i < 8; ++i) {
-        const float a = phase + static_cast<float>(i) * 0.78539816f;
-        const CpuVec2 petalCenter = {
-            center.x + std::cos(a) * scale * 0.18f,
-            center.y + std::sin(a) * scale * 0.18f,
-        };
-        petals = std::max(petals, SoftEllipse(uv, petalCenter, {scale * 0.115f, scale * 0.265f}, a + 1.5707963f, 0.22f));
-    }
-    return petals;
-}
-
-CpuColor DrawFlower(CpuColor color, CpuVec2 uv, CpuVec2 center, float scale, CpuColor petalColor, CpuColor coreColor, float phase) {
-    const float petals = FlowerPetals(uv, center, scale, phase);
-    const float shade = 0.78f + 0.22f * std::sin((uv.x - center.x) * 95.0f + (uv.y - center.y) * 38.0f);
-    color = Mix(color, Mul(petalColor, shade), petals * 0.90f);
-    const float inner = SoftCircle(uv, center, scale * 0.070f, scale * 0.040f);
-    const float seeds = inner * (0.72f + 0.28f * std::sin((uv.x + uv.y) * 360.0f));
-    color = Mix(color, Mul(coreColor, 0.86f + seeds * 0.30f), inner);
-    return Add(color, {1.0f, 0.72f, 0.48f}, petals * 0.05f);
-}
-
-CpuColor WallpaperPixel(float u, float v) {
-    CpuVec2 uv = {u, v};
-    CpuColor color = Mix({0.015f, 0.045f, 0.075f}, {0.050f, 0.120f, 0.150f}, v);
-    color = Add(color, {0.050f, 0.080f, 0.110f}, CpuFbm(u * 7.0f, v * 7.0f) * 0.72f);
-
-    color = DrawLeaf(color, uv, {0.24f, 0.28f}, 1.05f, -0.65f, {0.21f, 0.46f, 0.48f});
-    color = DrawLeaf(color, uv, {0.37f, 0.23f}, 0.92f, 0.58f, {0.33f, 0.48f, 0.35f});
-    color = DrawLeaf(color, uv, {0.70f, 0.24f}, 0.96f, -0.28f, {0.44f, 0.40f, 0.23f});
-    color = DrawLeaf(color, uv, {0.84f, 0.38f}, 0.82f, 0.70f, {0.25f, 0.54f, 0.55f});
-    color = DrawLeaf(color, uv, {0.18f, 0.72f}, 1.02f, 0.38f, {0.18f, 0.47f, 0.51f});
-    color = DrawLeaf(color, uv, {0.72f, 0.76f}, 1.10f, -0.78f, {0.48f, 0.43f, 0.27f});
-    color = DrawLeaf(color, uv, {0.52f, 0.56f}, 0.78f, 0.14f, {0.18f, 0.39f, 0.42f});
-
-    color = DrawFlower(color, uv, {0.13f, 0.22f}, 0.60f, {1.00f, 0.30f, 0.12f}, {0.48f, 0.20f, 0.06f}, 0.25f);
-    color = DrawFlower(color, uv, {0.38f, 0.48f}, 0.58f, {0.94f, 0.91f, 0.80f}, {0.62f, 0.50f, 0.20f}, 0.02f);
-    color = DrawFlower(color, uv, {0.79f, 0.54f}, 0.54f, {0.98f, 0.32f, 0.15f}, {0.45f, 0.18f, 0.06f}, 0.42f);
-    color = DrawFlower(color, uv, {0.63f, 0.86f}, 0.66f, {0.96f, 0.93f, 0.82f}, {0.58f, 0.47f, 0.20f}, -0.18f);
-    color = DrawFlower(color, uv, {0.97f, 0.17f}, 0.44f, {0.95f, 0.46f, 0.22f}, {0.50f, 0.22f, 0.07f}, 0.10f);
-
-    const float paper = CpuFbm(u * 33.0f, v * 33.0f) - 0.5f;
-    color = Add(color, {1.0f, 1.0f, 1.0f}, paper * 0.045f);
-    const float dx = u - 0.5f;
-    const float dy = v - 0.52f;
-    const float vignette = SmoothStep(0.96f, 0.28f, std::sqrt(dx * dx + dy * dy));
-    color = Mul(color, 0.66f + 0.40f * vignette);
-    return {Clamp01(color.r), Clamp01(color.g), Clamp01(color.b)};
-}
-
-std::vector<std::uint8_t> GenerateBackgroundPixels() {
-    std::vector<std::uint8_t> pixels(static_cast<size_t>(kBackgroundWidth) * static_cast<size_t>(kBackgroundHeight) * 4);
-    for (int y = 0; y < kBackgroundHeight; ++y) {
-        const float v = static_cast<float>(y) / static_cast<float>(kBackgroundHeight - 1);
-        for (int x = 0; x < kBackgroundWidth; ++x) {
-            const float u = static_cast<float>(x) / static_cast<float>(kBackgroundWidth - 1);
-            const CpuColor c = WallpaperPixel(u, v);
-            const size_t index = (static_cast<size_t>(y) * static_cast<size_t>(kBackgroundWidth) + static_cast<size_t>(x)) * 4;
-            pixels[index + 0] = static_cast<std::uint8_t>(Clamp01(c.r) * 255.0f);
-            pixels[index + 1] = static_cast<std::uint8_t>(Clamp01(c.g) * 255.0f);
-            pixels[index + 2] = static_cast<std::uint8_t>(Clamp01(c.b) * 255.0f);
-            pixels[index + 3] = 255;
-        }
-    }
-    return pixels;
-}
-
 std::vector<char> ReadBinaryFile(const std::wstring& path) {
     std::ifstream file(path.c_str(), std::ios::ate | std::ios::binary);
     if (!file) {
@@ -334,8 +179,108 @@ void CheckVk(VkResult result, const char* message) {
     }
 }
 
+void CheckHr(HRESULT result, const char* message) {
+    if (FAILED(result)) {
+        throw std::runtime_error(message);
+    }
+}
+
 void ShowError(const std::string& message) {
     MessageBoxA(nullptr, message.c_str(), "LiquidGlassPill", MB_ICONERROR | MB_OK);
+}
+
+struct ComInitializer {
+    HRESULT result = S_OK;
+    bool uninitialize = false;
+
+    ComInitializer() {
+        result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (result == RPC_E_CHANGED_MODE) {
+            result = S_OK;
+            return;
+        }
+        uninitialize = SUCCEEDED(result);
+    }
+
+    ~ComInitializer() {
+        if (uninitialize) {
+            CoUninitialize();
+        }
+    }
+};
+
+template <typename T>
+struct ComPtr {
+    T* ptr = nullptr;
+
+    ComPtr() = default;
+
+    ~ComPtr() {
+        if (ptr) {
+            ptr->Release();
+        }
+    }
+
+    ComPtr(const ComPtr&) = delete;
+    ComPtr& operator=(const ComPtr&) = delete;
+
+    T* Get() const {
+        return ptr;
+    }
+
+    T** GetAddressOf() {
+        return &ptr;
+    }
+
+    T* operator->() const {
+        return ptr;
+    }
+};
+
+ImagePixels LoadBackgroundPixels() {
+    ComInitializer com;
+    CheckHr(com.result, "Could not initialize Windows imaging.");
+
+    ComPtr<IWICImagingFactory> factory;
+    CheckHr(
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory, reinterpret_cast<void**>(factory.GetAddressOf())),
+        "Could not create the Windows imaging factory.");
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    CheckHr(
+        factory->CreateDecoderFromFilename(kBackgroundImagePath, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, decoder.GetAddressOf()),
+        "Could not open C:\\Users\\jluiz\\Desktop\\Newspaper.png.");
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    CheckHr(decoder->GetFrame(0, frame.GetAddressOf()), "Could not decode the first frame of Newspaper.png.");
+
+    UINT width = 0;
+    UINT height = 0;
+    CheckHr(frame->GetSize(&width, &height), "Could not read the Newspaper.png dimensions.");
+    if (width == 0 || height == 0) {
+        throw std::runtime_error("Newspaper.png has invalid dimensions.");
+    }
+
+    ComPtr<IWICFormatConverter> converter;
+    CheckHr(factory->CreateFormatConverter(converter.GetAddressOf()), "Could not create the PNG format converter.");
+    CheckHr(
+        converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom),
+        "Could not convert Newspaper.png to RGBA pixels.");
+
+    const size_t stride = static_cast<size_t>(width) * 4u;
+    const size_t bufferSize = stride * static_cast<size_t>(height);
+    if (stride > UINT32_MAX || bufferSize > UINT32_MAX) {
+        throw std::runtime_error("Newspaper.png is too large for this demo texture upload path.");
+    }
+
+    ImagePixels image;
+    image.width = static_cast<std::uint32_t>(width);
+    image.height = static_cast<std::uint32_t>(height);
+    image.rgba.resize(bufferSize);
+    CheckHr(
+        converter->CopyPixels(nullptr, static_cast<UINT>(stride), static_cast<UINT>(image.rgba.size()), image.rgba.data()),
+        "Could not copy Newspaper.png pixels.");
+    return image;
 }
 
 float PillSdfAt(float pillX, float pillY, float pillW, float pillH, float x, float y) {
@@ -383,8 +328,18 @@ void PulseSideGoo(AppState& app, int side, float amount) {
     if (side == 0) {
         return;
     }
-    app.sideGooSide = side < 0 ? -1 : 1;
+    app.sideGooSide = std::clamp(side, -2, 2);
     app.sideGooAmount = std::max(app.sideGooAmount, Clamp01(amount));
+    app.pillAnimationUpdatedAt = std::chrono::steady_clock::now();
+    app.needsRedraw = true;
+}
+
+void SetSideGoo(AppState& app, int side, float amount) {
+    if (side == 0) {
+        return;
+    }
+    app.sideGooSide = std::clamp(side, -2, 2);
+    app.sideGooAmount = Clamp01(amount);
     app.pillAnimationUpdatedAt = std::chrono::steady_clock::now();
     app.needsRedraw = true;
 }
@@ -410,7 +365,7 @@ void SetPillOrientation(AppState& app, bool vertical, int dockSide) {
     ApplyPillOrientation(app);
     if (app.pillVertical) {
         app.pillX = app.pillDockSide < 0 ? app.pillW * 0.5f : static_cast<float>(app.width) - app.pillW * 0.5f;
-        PulseSideGoo(app, app.pillDockSide, 1.0f);
+        PulseSideGoo(app, app.pillDockSide, 0.66f);
     }
     ClampPill(app);
     StartPillTransition(app);
@@ -440,24 +395,30 @@ void UpdateDraggedPill(AppState& app, float pointerX, float pointerY) {
         if (!app.pillVertical) {
             const float topLimit = app.pillH * 0.5f;
             const float bottomLimit = static_cast<float>(app.height) - app.pillH * 0.5f;
-            const float releaseDistance = app.pillH * 0.58f;
+            const float releaseDistance = app.pillH * 0.48f;
             if (app.pillDockEdgeY != 0) {
                 const int edge = app.pillDockEdgeY < 0 ? -1 : 1;
+                const int gooEdge = edge < 0 ? -2 : 2;
                 const float dockY = edge < 0 ? topLimit : bottomLimit;
                 const float inwardDistance = edge < 0 ? rawY - dockY : dockY - rawY;
                 if (inwardDistance > releaseDistance) {
+                    PulseSideGoo(app, gooEdge, 0.86f);
                     app.pillDockEdgeY = 0;
                     app.pillY = rawY;
                     ClampPill(app);
                 } else {
                     app.pillY = dockY;
+                    const float pull = SmoothStep(0.0f, 1.0f, Clamp01(inwardDistance / releaseDistance));
+                    SetSideGoo(app, gooEdge, 0.18f + pull * 0.72f);
                 }
             } else if (app.pillY <= topLimit + edgeEpsilon) {
                 app.pillDockEdgeY = -1;
                 app.pillY = topLimit;
+                PulseSideGoo(app, -2, 0.58f);
             } else if (app.pillY >= bottomLimit - edgeEpsilon) {
                 app.pillDockEdgeY = 1;
                 app.pillY = bottomLimit;
+                PulseSideGoo(app, 2, 0.58f);
             }
         }
         if (!app.pillAnimating) {
@@ -469,19 +430,19 @@ void UpdateDraggedPill(AppState& app, float pointerX, float pointerY) {
     const int side = app.pillDockSide < 0 ? -1 : 1;
     const float dockX = side < 0 ? app.pillW * 0.5f : static_cast<float>(app.width) - app.pillW * 0.5f;
     const float unclampedCenterX = pointerX - app.dragOffsetX;
-    const float releaseDistance = app.pillW * 0.62f;
+    const float releaseDistance = app.pillW * 0.50f;
     const float inwardDistance = side < 0 ? unclampedCenterX - dockX : dockX - unclampedCenterX;
 
     if (inwardDistance > releaseDistance) {
-        PulseSideGoo(app, side, 1.0f);
+        PulseSideGoo(app, side, 0.92f);
         SetPillOrientation(app, false, 0);
         app.dragOffsetX = pointerX - app.pillX;
         app.dragOffsetY = pointerY - app.pillY;
     } else {
         app.pillX = dockX;
         ClampPill(app);
-        const float pressure = 1.0f - Clamp01(inwardDistance / releaseDistance);
-        PulseSideGoo(app, side, 0.42f + pressure * 0.34f);
+        const float pull = SmoothStep(0.0f, 1.0f, Clamp01(inwardDistance / releaseDistance));
+        SetSideGoo(app, side, 0.18f + pull * 0.72f);
     }
     if (!app.pillAnimating) {
         SyncPillVisualToTarget(app);
@@ -824,8 +785,8 @@ VkImageView CreateImageView(AppState& app, VkImage image, VkFormat format) {
 }
 
 void CreateBackgroundTexture(AppState& app) {
-    const auto pixels = GenerateBackgroundPixels();
-    const VkDeviceSize imageSize = pixels.size();
+    const ImagePixels image = LoadBackgroundPixels();
+    const VkDeviceSize imageSize = image.rgba.size();
 
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
@@ -833,12 +794,12 @@ void CreateBackgroundTexture(AppState& app) {
 
     void* mapped = nullptr;
     CheckVk(vkMapMemory(app.device, stagingMemory, 0, imageSize, 0, &mapped), "Could not map staging memory.");
-    std::memcpy(mapped, pixels.data(), pixels.size());
+    std::memcpy(mapped, image.rgba.data(), image.rgba.size());
     vkUnmapMemory(app.device, stagingMemory);
 
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.extent = {kBackgroundWidth, kBackgroundHeight, 1};
+    imageInfo.extent = {image.width, image.height, 1};
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
     imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -859,7 +820,7 @@ void CreateBackgroundTexture(AppState& app) {
     CheckVk(vkBindImageMemory(app.device, app.backgroundImage, app.backgroundMemory, 0), "Could not bind background texture memory.");
 
     TransitionImageLayout(app, app.backgroundImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    CopyBufferToImage(app, stagingBuffer, app.backgroundImage, kBackgroundWidth, kBackgroundHeight);
+    CopyBufferToImage(app, stagingBuffer, app.backgroundImage, image.width, image.height);
     TransitionImageLayout(app, app.backgroundImage, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     vkDestroyBuffer(app.device, stagingBuffer, nullptr);

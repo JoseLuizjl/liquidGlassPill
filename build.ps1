@@ -45,6 +45,9 @@ Invoke-Checked $Compiler @(
     (Join-Path $VulkanSdk "Lib\vulkan-1.lib"),
     "-lgdi32",
     "-luser32",
+    "-lole32",
+    "-lwindowscodecs",
+    "-luuid",
     "-o",
     $Output
 )

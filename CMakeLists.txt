@@ -27,4 +27,7 @@ target_link_libraries(LiquidGlassPill PRIVATE
     "C:/VulkanSDK/1.4.350.0/Lib/vulkan-1.lib"
     gdi32
     user32
+    ole32
+    windowscodecs
+    uuid
 )
