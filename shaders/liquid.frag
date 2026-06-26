@@ -15,6 +15,22 @@ layout(push_constant) uniform PushConstants {
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 outColor;
 
+const float kLgE = 2.718281828459045;
+const float kLgBlurRadius = 0.404;
+const float kLgBlurDownscale = 0.981;
+const float kLgFPower = 1.100;
+const float kLgA = 0.340;
+const float kLgB = 2.880;
+const float kLgC = 3.000;
+const float kLgD = 4.650;
+const float kLgGlowWeight = 0.177;
+const float kLgGlowBias = 0.049;
+const float kLgGlowEdge0 = 0.514;
+const float kLgGlowEdge1 = -0.530;
+const float kLgDepthBoost = 1.12;
+const float kLgReflectionWeight = 0.105;
+const float kLgSurfaceTint = 0.038;
+
 float pillSdfAt(vec2 p, vec2 center, vec2 size, float gooAmount, float edgeDockSide) {
     float radius = min(size.x, size.y) * 0.5;
     vec2 rel = (p - center) / size;
@@ -72,13 +88,46 @@ vec3 bg(vec2 p) {
     return texture(u_background, uv).rgb;
 }
 
-vec3 softBg(vec2 p, float r) {
-    vec3 c = bg(p) * 0.56;
-    c += bg(p + vec2( r, 0.0)) * 0.11;
-    c += bg(p + vec2(-r, 0.0)) * 0.11;
-    c += bg(p + vec2(0.0,  r)) * 0.11;
-    c += bg(p + vec2(0.0, -r)) * 0.11;
-    return c;
+vec3 bgUv(vec2 uv) {
+    return texture(u_background, clamp(uv, vec2(0.001), vec2(0.999))).rgb;
+}
+
+vec3 blur13Bg(vec2 uv, vec2 direction) {
+    vec2 resolution = pc.resolution * kLgBlurDownscale;
+    vec2 off1 = vec2(1.411764705882353) * direction;
+    vec2 off2 = vec2(3.2941176470588234) * direction;
+    vec2 off3 = vec2(5.176470588235294) * direction;
+    vec3 color = bgUv(uv) * 0.1964825501511404;
+    color += bgUv(uv + off1 / resolution) * 0.2969069646728344;
+    color += bgUv(uv - off1 / resolution) * 0.2969069646728344;
+    color += bgUv(uv + off2 / resolution) * 0.09447039785044732;
+    color += bgUv(uv - off2 / resolution) * 0.09447039785044732;
+    color += bgUv(uv + off3 / resolution) * 0.010381362401148057;
+    color += bgUv(uv - off3 / resolution) * 0.010381362401148057;
+    return color;
+}
+
+vec3 liquidBlurBg(vec2 uv) {
+    vec3 horizontal = blur13Bg(uv, vec2(kLgBlurRadius, 0.0));
+    vec3 vertical = blur13Bg(uv, vec2(0.0, kLgBlurRadius));
+    return (horizontal + vertical) * 0.5;
+}
+
+float liquidCurve(float x) {
+    return 1.0 - kLgB * pow(kLgC * kLgE, -kLgD * x - kLgA);
+}
+
+float signedPow(float value, float power) {
+    return sign(value) * pow(abs(value), power);
+}
+
+float smoothstepAny(float edge0, float edge1, float value) {
+    float t = clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+float liquidGlow(vec2 local) {
+    return sin(atan(local.y, local.x) - 0.5);
 }
 
 vec3 liquidGlass(vec2 p, float d) {
@@ -109,58 +158,46 @@ vec3 liquidGlass(vec2 p, float d) {
     }
     float rearPull = goo * gooEdge;
 
-    float insideDistance = max(-d, 0.0);
-    float edgeWidth = shortSide * 0.28;
-    float rim = 1.0 - smoothstep(0.0, edgeWidth, insideDistance);
+    vec2 local = rel * 2.0;
+    float dist = clamp(max(-d, 0.0) / (shortSide * 0.50), 0.0, 1.35);
+    float rim = 1.0 - smoothstep(0.0, 0.38, dist);
     float rimPower = rim * rim;
-    float meniscus = exp(-pow(d + shortSide * 0.060, 2.0) / (shortSide * shortSide * 0.018));
-    float endCap = smoothstep(0.34, 0.52, abs(rel.x)) * (1.0 - smoothstep(0.30, 0.58, abs(rel.y)));
-    float topEdge = (1.0 - smoothstep(-0.62, -0.36, rel.y)) * rim;
-    float bottomEdge = smoothstep(0.35, 0.62, rel.y) * rim;
-    float edgeNoise = waveNoise(p * 0.23 + rel * 17.0) * rim * (0.16 + rearPull * 0.38);
-    float curl = sin((rel.x * 2.10 + rel.y * 0.38 + edgeNoise) * 6.2831853) * rim;
+    float curve = liquidCurve(dist);
+    float warpedScale = signedPow(curve, kLgFPower);
+    vec2 sampleLocal = mix(local, local * warpedScale, kLgDepthBoost);
 
-    vec2 coreNormal = normalize(vec2(rel.x * 0.24, rel.y * 0.18 - 0.10));
-    vec2 shapeNormal = normalize(mix(coreNormal, g, smoothstep(0.10, 0.58, rim)));
-    vec2 normal = normalize(shapeNormal + tangent * curl * 0.050 + vec2(edgeNoise, -edgeNoise) * 0.030 + contactAxis * rearPull * 0.10);
-    float dragLift = pc.dragging * (0.70 + 3.30 * rim);
-    float opticalPower = 1.25 + 88.0 * rimPower + 54.0 * endCap + 22.0 * meniscus + dragLift;
-    vec2 displacement = normal * opticalPower;
-    displacement += tangent * curl * (2.5 + 10.0 * rimPower + 8.0 * endCap);
-    displacement += vec2(rel.x * -2.0, rel.y * -1.2) * (1.0 - rim) * 0.12;
-    displacement += contactAxis * rearPull * (14.0 + 28.0 * rim + pull * 10.0);
-    displacement += tangent * sin(longCoord * 9.0 + pc.time * 4.0) * rearPull * (2.2 + 6.0 * rim);
+    float edgeNoise = waveNoise(p * 0.18 + rel * 13.0) * rim * (0.050 + rearPull * 0.14);
+    vec2 coreNormal = normalize(vec2(local.x * 0.22, local.y * 0.16 - 0.08));
+    vec2 shapeNormal = normalize(mix(coreNormal, g, smoothstep(0.18, 0.70, rim)));
+    vec2 normal = normalize(shapeNormal + contactAxis * rearPull * 0.11 + vec2(edgeNoise, -edgeNoise) * 0.055);
 
-    vec2 samplePoint = p + displacement;
-    vec2 chroma = normal * (0.9 + 6.2 * rimPower + 4.6 * endCap);
-    float blurRadius = mix(2.2, 0.75, rim) + rearPull * 1.25;
+    vec2 samplePoint = pc.pillCenter + sampleLocal * pc.pillSize * 0.5;
+    samplePoint += normal * (pc.dragging * (0.65 + 3.80 * rim) + rimPower * 6.2);
+    samplePoint += contactAxis * rearPull * shortSide * (0.10 + 0.22 * rim + 0.10 * pull);
+    samplePoint += tangent * sin(longCoord * 9.0 + pc.time * 4.0) * rearPull * shortSide * 0.040;
 
-    vec3 refracted;
-    refracted.r = softBg(samplePoint - chroma * 1.30, blurRadius).r;
-    refracted.g = softBg(samplePoint, blurRadius).g;
-    refracted.b = softBg(samplePoint + chroma * 1.30, blurRadius).b;
+    vec2 uv = clamp(samplePoint / pc.resolution, vec2(0.001), vec2(0.999));
+    vec3 glass = liquidBlurBg(uv);
 
-    vec3 direct = bg(samplePoint + normal * meniscus * 2.0);
-    vec3 glass = mix(refracted, direct, 0.76 - rim * 0.24);
-    glass = mix(glass, vec3(0.86, 0.97, 1.0), 0.014 + rim * 0.030);
+    float glowMask = smoothstepAny(kLgGlowEdge0, kLgGlowEdge1, dist);
+    float glowMul = liquidGlow(local) * kLgGlowWeight * glowMask + 1.0 + kLgGlowBias;
+    glass *= glowMul;
 
-    vec3 n3 = normalize(vec3(normal * (0.70 + 0.95 * rim), 0.95 - rim * 0.20));
-    vec3 light = normalize(vec3(-0.50, -0.78, 0.95));
-    float spec = pow(max(dot(n3, normalize(light + vec3(0.0, 0.0, 1.0))), 0.0), 92.0) * 0.20;
-    float outline = 1.0 - smoothstep(0.0, 2.4, abs(d));
-    float innerEdge = meniscus * rim;
-    float topSheen = topEdge * (0.55 + 0.45 * smoothstep(0.34, 0.52, abs(rel.x)));
-    float bottomSheen = bottomEdge * (0.35 + 0.65 * endCap);
-    float contactSheen = rearPull * (0.42 + 0.58 * rim);
+    vec3 reflected = bgUv(uv + normal * (0.009 + rim * 0.018));
+    glass = mix(glass, reflected, rim * kLgReflectionWeight);
+    glass = mix(glass, vec3(0.82, 0.95, 1.0), kLgSurfaceTint * (0.35 + rim));
+
+    vec3 n3 = normalize(vec3(normal * (0.58 + 0.55 * rim), 0.92 - rim * 0.16));
+    vec3 light = normalize(vec3(-0.48, -0.74, 1.0));
+    float spec = pow(max(dot(n3, normalize(light + vec3(0.0, 0.0, 1.0))), 0.0), 78.0) * (0.07 + rim * 0.22);
+    float outline = 1.0 - smoothstep(0.0, 0.035, dist);
+    float contactSheen = rearPull * (0.35 + 0.65 * rim);
 
     glass += vec3(1.0) * spec;
-    glass += vec3(1.0, 1.0, 0.94) * outline * 0.24;
-    glass += vec3(0.45, 0.78, 1.0) * innerEdge * 0.040;
-    glass += vec3(1.0) * topSheen * 0.045;
-    glass += vec3(0.78, 0.96, 1.0) * bottomSheen * 0.030;
-    glass += vec3(0.70, 0.94, 1.0) * contactSheen * 0.060;
-    glass += vec3(1.0, 1.0, 0.95) * contactSheen * meniscus * 0.050;
-    glass -= vec3(0.035, 0.050, 0.065) * smoothstep(0.05, 0.68, rel.y) * 0.52;
+    glass += vec3(1.0, 1.0, 0.94) * outline * 0.135;
+    glass += vec3(0.78, 0.93, 1.0) * rim * 0.035;
+    glass += vec3(0.70, 0.94, 1.0) * contactSheen * 0.070;
+    glass -= vec3(0.020, 0.030, 0.040) * smoothstep(0.08, 0.72, rel.y) * 0.34;
     return clamp(glass, 0.0, 1.0);
 }
 
@@ -176,7 +213,7 @@ void main() {
     float inside = 1.0 - smoothstep(0.0, 1.4, d);
     if (inside > 0.001) {
         vec3 glass = liquidGlass(p, d);
-        color = mix(color, glass, inside * 0.66);
+        color = mix(color, glass, inside * 0.76);
 
         float dots = 0.0;
         bool vertical = pc.pillSize.y > pc.pillSize.x;
