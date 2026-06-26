@@ -23,6 +23,10 @@ constexpr int kInitialHeight = 640;
 constexpr int kMaxFramesInFlight = 2;
 constexpr int kBackgroundWidth = 1280;
 constexpr int kBackgroundHeight = 720;
+constexpr float kPillTransitionResponsiveness = 11.5f;
+constexpr float kPillTransitionSnapEpsilon = 0.35f;
+constexpr float kGooDecayResponsiveness = 5.25f;
+constexpr float kGooSnapEpsilon = 0.015f;
 
 struct CpuColor {
     float r;
@@ -41,6 +45,8 @@ struct PushConstants {
     float dragging;
     float pillCenter[2];
     float pillSize[2];
+    float gooAmount;
+    float edgeDockSide;
 };
 
 struct QueueFamilyIndices {
@@ -67,15 +73,29 @@ struct AppState {
     bool needsRedraw = true;
     bool forceFullRedraw = true;
     bool running = true;
+    bool vulkanReady = false;
 
     float pillX = kInitialWidth * 0.5f;
     float pillY = kInitialHeight * 0.52f;
+    float pillBaseW = 430.0f;
+    float pillBaseH = 150.0f;
     float pillW = 430.0f;
     float pillH = 150.0f;
+    float visualPillX = kInitialWidth * 0.5f;
+    float visualPillY = kInitialHeight * 0.52f;
+    float visualPillW = 430.0f;
+    float visualPillH = 150.0f;
+    bool pillVertical = false;
+    int pillDockSide = 0;
+    int pillDockEdgeY = 0;
+    bool pillAnimating = false;
+    float sideGooAmount = 0.0f;
+    int sideGooSide = 0;
     bool dragging = false;
     float dragOffsetX = 0.0f;
     float dragOffsetY = 0.0f;
     std::chrono::steady_clock::time_point startedAt;
+    std::chrono::steady_clock::time_point pillAnimationUpdatedAt;
 
     VkInstance instance = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
@@ -127,6 +147,10 @@ float Clamp01(float value) {
 float SmoothStep(float edge0, float edge1, float value) {
     const float t = Clamp01((value - edge0) / (edge1 - edge0));
     return t * t * (3.0f - 2.0f * t);
+}
+
+float Lerp(float a, float b, float t) {
+    return a + (b - a) * t;
 }
 
 float CpuHash(float x, float y) {
@@ -314,17 +338,60 @@ void ShowError(const std::string& message) {
     MessageBoxA(nullptr, message.c_str(), "LiquidGlassPill", MB_ICONERROR | MB_OK);
 }
 
-float PillSdf(const AppState& app, float x, float y) {
-    const float radius = app.pillH * 0.5f;
-    const float qx = std::fabs(x - app.pillX) - app.pillW * 0.5f + radius;
-    const float qy = std::fabs(y - app.pillY) - app.pillH * 0.5f + radius;
+float PillSdfAt(float pillX, float pillY, float pillW, float pillH, float x, float y) {
+    const float radius = std::min(pillW, pillH) * 0.5f;
+    const float qx = std::fabs(x - pillX) - pillW * 0.5f + radius;
+    const float qy = std::fabs(y - pillY) - pillH * 0.5f + radius;
     const float outsideX = std::max(qx, 0.0f);
     const float outsideY = std::max(qy, 0.0f);
     return std::min(std::max(qx, qy), 0.0f) + std::sqrt(outsideX * outsideX + outsideY * outsideY) - radius;
 }
 
+float PillSdf(const AppState& app, float x, float y) {
+    return PillSdfAt(app.visualPillX, app.visualPillY, app.visualPillW, app.visualPillH, x, y);
+}
+
 bool HitPill(const AppState& app, float x, float y) {
     return PillSdf(app, x, y) <= 0.0f;
+}
+
+float PillVisualDelta(const AppState& app) {
+    const float positionDelta = std::max(std::fabs(app.visualPillX - app.pillX), std::fabs(app.visualPillY - app.pillY));
+    const float sizeDelta = std::max(std::fabs(app.visualPillW - app.pillW), std::fabs(app.visualPillH - app.pillH));
+    return std::max(positionDelta, sizeDelta);
+}
+
+void SyncPillVisualToTarget(AppState& app) {
+    app.visualPillX = app.pillX;
+    app.visualPillY = app.pillY;
+    app.visualPillW = app.pillW;
+    app.visualPillH = app.pillH;
+    app.pillAnimating = false;
+}
+
+void StartPillTransition(AppState& app) {
+    if (PillVisualDelta(app) <= kPillTransitionSnapEpsilon) {
+        SyncPillVisualToTarget(app);
+        return;
+    }
+    app.pillAnimating = true;
+    app.pillAnimationUpdatedAt = std::chrono::steady_clock::now();
+    app.needsRedraw = true;
+}
+
+void PulseSideGoo(AppState& app, int side, float amount) {
+    if (side == 0) {
+        return;
+    }
+    app.sideGooSide = side < 0 ? -1 : 1;
+    app.sideGooAmount = std::max(app.sideGooAmount, Clamp01(amount));
+    app.pillAnimationUpdatedAt = std::chrono::steady_clock::now();
+    app.needsRedraw = true;
+}
+
+void ApplyPillOrientation(AppState& app) {
+    app.pillW = app.pillVertical ? app.pillBaseH : app.pillBaseW;
+    app.pillH = app.pillVertical ? app.pillBaseW : app.pillBaseH;
 }
 
 void ClampPill(AppState& app) {
@@ -336,16 +403,101 @@ void ClampPill(AppState& app) {
     app.pillY = std::clamp(app.pillY, halfH, maxY);
 }
 
+void SetPillOrientation(AppState& app, bool vertical, int dockSide) {
+    app.pillVertical = vertical;
+    app.pillDockSide = vertical ? (dockSide < 0 ? -1 : 1) : 0;
+    app.pillDockEdgeY = 0;
+    ApplyPillOrientation(app);
+    if (app.pillVertical) {
+        app.pillX = app.pillDockSide < 0 ? app.pillW * 0.5f : static_cast<float>(app.width) - app.pillW * 0.5f;
+        PulseSideGoo(app, app.pillDockSide, 1.0f);
+    }
+    ClampPill(app);
+    StartPillTransition(app);
+}
+
+void UpdateDraggedPill(AppState& app, float pointerX, float pointerY) {
+    const float rawX = pointerX - app.dragOffsetX;
+    const float rawY = pointerY - app.dragOffsetY;
+    app.pillX = rawX;
+    app.pillY = rawY;
+    ClampPill(app);
+
+    constexpr float edgeEpsilon = 0.5f;
+    const float leftLimit = app.pillW * 0.5f;
+    const float rightLimit = static_cast<float>(app.width) - app.pillW * 0.5f;
+
+    if (!app.pillVertical) {
+        if (app.pillX <= leftLimit + edgeEpsilon) {
+            SetPillOrientation(app, true, -1);
+            app.dragOffsetX = pointerX - app.pillX;
+            app.dragOffsetY = pointerY - app.pillY;
+        } else if (app.pillX >= rightLimit - edgeEpsilon) {
+            SetPillOrientation(app, true, 1);
+            app.dragOffsetX = pointerX - app.pillX;
+            app.dragOffsetY = pointerY - app.pillY;
+        }
+        if (!app.pillVertical) {
+            const float topLimit = app.pillH * 0.5f;
+            const float bottomLimit = static_cast<float>(app.height) - app.pillH * 0.5f;
+            const float releaseDistance = app.pillH * 0.58f;
+            if (app.pillDockEdgeY != 0) {
+                const int edge = app.pillDockEdgeY < 0 ? -1 : 1;
+                const float dockY = edge < 0 ? topLimit : bottomLimit;
+                const float inwardDistance = edge < 0 ? rawY - dockY : dockY - rawY;
+                if (inwardDistance > releaseDistance) {
+                    app.pillDockEdgeY = 0;
+                    app.pillY = rawY;
+                    ClampPill(app);
+                } else {
+                    app.pillY = dockY;
+                }
+            } else if (app.pillY <= topLimit + edgeEpsilon) {
+                app.pillDockEdgeY = -1;
+                app.pillY = topLimit;
+            } else if (app.pillY >= bottomLimit - edgeEpsilon) {
+                app.pillDockEdgeY = 1;
+                app.pillY = bottomLimit;
+            }
+        }
+        if (!app.pillAnimating) {
+            SyncPillVisualToTarget(app);
+        }
+        return;
+    }
+
+    const int side = app.pillDockSide < 0 ? -1 : 1;
+    const float dockX = side < 0 ? app.pillW * 0.5f : static_cast<float>(app.width) - app.pillW * 0.5f;
+    const float unclampedCenterX = pointerX - app.dragOffsetX;
+    const float releaseDistance = app.pillW * 0.62f;
+    const float inwardDistance = side < 0 ? unclampedCenterX - dockX : dockX - unclampedCenterX;
+
+    if (inwardDistance > releaseDistance) {
+        PulseSideGoo(app, side, 1.0f);
+        SetPillOrientation(app, false, 0);
+        app.dragOffsetX = pointerX - app.pillX;
+        app.dragOffsetY = pointerY - app.pillY;
+    } else {
+        app.pillX = dockX;
+        ClampPill(app);
+        const float pressure = 1.0f - Clamp01(inwardDistance / releaseDistance);
+        PulseSideGoo(app, side, 0.42f + pressure * 0.34f);
+    }
+    if (!app.pillAnimating) {
+        SyncPillVisualToTarget(app);
+    }
+}
+
 VkRect2D FullRect(const AppState& app) {
     return {{0, 0}, {static_cast<std::uint32_t>(std::max(app.width, 1)), static_cast<std::uint32_t>(std::max(app.height, 1))}};
 }
 
 VkRect2D PillRect(const AppState& app) {
-    const int margin = static_cast<int>(std::ceil(app.pillH * 0.70f));
-    const int left = static_cast<int>(std::floor(app.pillX - app.pillW * 0.5f)) - margin;
-    const int top = static_cast<int>(std::floor(app.pillY - app.pillH * 0.5f)) - margin;
-    const int right = static_cast<int>(std::ceil(app.pillX + app.pillW * 0.5f)) + margin;
-    const int bottom = static_cast<int>(std::ceil(app.pillY + app.pillH * 0.5f)) + margin;
+    const int margin = static_cast<int>(std::ceil(app.visualPillH * 0.70f));
+    const int left = static_cast<int>(std::floor(app.visualPillX - app.visualPillW * 0.5f)) - margin;
+    const int top = static_cast<int>(std::floor(app.visualPillY - app.visualPillH * 0.5f)) - margin;
+    const int right = static_cast<int>(std::ceil(app.visualPillX + app.visualPillW * 0.5f)) + margin;
+    const int bottom = static_cast<int>(std::ceil(app.visualPillY + app.visualPillH * 0.5f)) + margin;
 
     const int clampedLeft = std::clamp(left, 0, std::max(app.width, 1));
     const int clampedTop = std::clamp(top, 0, std::max(app.height, 1));
@@ -386,19 +538,87 @@ void InvalidateFull(AppState& app) {
     app.forceFullRedraw = true;
 }
 
+void UpdatePillTransition(AppState& app) {
+    if (!app.pillAnimating && app.sideGooAmount <= 0.0f) {
+        return;
+    }
+
+    const VkRect2D previous = PillRect(app);
+    const auto now = std::chrono::steady_clock::now();
+    const float elapsed = std::chrono::duration<float>(now - app.pillAnimationUpdatedAt).count();
+    const float dt = std::clamp(elapsed, 0.0f, 0.050f);
+    app.pillAnimationUpdatedAt = now;
+
+    if (app.pillAnimating) {
+        const float t = 1.0f - std::exp(-kPillTransitionResponsiveness * dt);
+        app.visualPillX = Lerp(app.visualPillX, app.pillX, t);
+        app.visualPillY = Lerp(app.visualPillY, app.pillY, t);
+        app.visualPillW = Lerp(app.visualPillW, app.pillW, t);
+        app.visualPillH = Lerp(app.visualPillH, app.pillH, t);
+
+        if (PillVisualDelta(app) <= kPillTransitionSnapEpsilon) {
+            SyncPillVisualToTarget(app);
+        }
+    }
+
+    if (app.sideGooAmount > 0.0f) {
+        app.sideGooAmount *= std::exp(-kGooDecayResponsiveness * dt);
+        if (app.sideGooAmount <= kGooSnapEpsilon) {
+            app.sideGooAmount = 0.0f;
+            app.sideGooSide = 0;
+        }
+    }
+
+    InvalidatePill(app, previous);
+}
+
 void ResizePill(AppState& app, int width, int height) {
     app.width = std::max(width, 1);
     app.height = std::max(height, 1);
     app.minimized = width == 0 || height == 0;
-    app.pillW = std::min(430.0f, static_cast<float>(app.width) * 0.78f);
-    app.pillH = std::min(150.0f, std::max(88.0f, static_cast<float>(app.height) * 0.28f));
-    if (app.pillW < app.pillH * 2.2f) {
-        app.pillW = app.pillH * 2.2f;
+    app.pillBaseW = std::min(430.0f, static_cast<float>(app.width) * 0.78f);
+    app.pillBaseH = std::min(150.0f, std::max(88.0f, static_cast<float>(app.height) * 0.28f));
+    if (app.pillBaseW < app.pillBaseH * 2.2f) {
+        app.pillBaseW = app.pillBaseH * 2.2f;
     }
-    app.pillW = std::min(app.pillW, static_cast<float>(app.width) * 0.92f);
+    app.pillBaseW = std::min(app.pillBaseW, static_cast<float>(app.width) * 0.92f);
+    ApplyPillOrientation(app);
+    if (app.pillVertical) {
+        app.pillX = app.pillDockSide < 0 ? app.pillW * 0.5f : static_cast<float>(app.width) - app.pillW * 0.5f;
+    } else if (app.pillDockEdgeY != 0) {
+        app.pillY = app.pillDockEdgeY < 0 ? app.pillH * 0.5f : static_cast<float>(app.height) - app.pillH * 0.5f;
+    }
     ClampPill(app);
+    SyncPillVisualToTarget(app);
     app.framebufferResized = true;
     InvalidateFull(app);
+}
+
+bool RefreshClientSize(AppState& app) {
+    RECT client{};
+    if (!GetClientRect(app.window, &client)) {
+        return false;
+    }
+
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width == 0 || height == 0) {
+        app.minimized = true;
+        return false;
+    }
+
+    app.minimized = false;
+    if (width != app.width || height != app.height) {
+        ResizePill(app, width, height);
+    }
+    return true;
+}
+
+bool SurfaceHasDrawableExtent(const VkSurfaceCapabilitiesKHR& capabilities, const AppState& app) {
+    if (capabilities.currentExtent.width != UINT32_MAX) {
+        return capabilities.currentExtent.width > 0 && capabilities.currentExtent.height > 0;
+    }
+    return app.width > 0 && app.height > 0 && capabilities.maxImageExtent.width > 0 && capabilities.maxImageExtent.height > 0;
 }
 
 QueueFamilyIndices FindQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface) {
@@ -748,6 +968,10 @@ void CreateLogicalDevice(AppState& app) {
 
 void CreateSwapchain(AppState& app) {
     SwapchainSupport support = QuerySwapchainSupport(app.physicalDevice, app.surface);
+    if (support.formats.empty() || support.presentModes.empty() || !SurfaceHasDrawableExtent(support.capabilities, app)) {
+        throw std::runtime_error("Vulkan surface is not ready for a swapchain.");
+    }
+
     const VkSurfaceFormatKHR surfaceFormat = ChooseSurfaceFormat(support.formats);
     const VkPresentModeKHR presentMode = ChoosePresentMode(support.presentModes);
     const VkExtent2D extent = ChooseExtent(support.capabilities, app);
@@ -1076,9 +1300,17 @@ void CreateSwapchainObjects(AppState& app) {
 }
 
 void RecreateSwapchain(AppState& app) {
-    if (app.minimized) {
+    if (app.minimized || !RefreshClientSize(app)) {
         return;
     }
+
+    const SwapchainSupport support = QuerySwapchainSupport(app.physicalDevice, app.surface);
+    if (support.formats.empty() || support.presentModes.empty() || !SurfaceHasDrawableExtent(support.capabilities, app)) {
+        app.minimized = true;
+        app.framebufferResized = false;
+        return;
+    }
+
     CheckVk(vkDeviceWaitIdle(app.device), "Could not wait for Vulkan device before swapchain recreation.");
     CleanupSwapchain(app);
     CreateSwapchainObjects(app);
@@ -1127,10 +1359,12 @@ void RecordCommandBuffer(AppState& app, VkCommandBuffer commandBuffer, std::uint
     constants.resolution[1] = static_cast<float>(app.swapchainExtent.height);
     constants.time = seconds;
     constants.dragging = app.dragging ? 1.0f : 0.0f;
-    constants.pillCenter[0] = app.pillX;
-    constants.pillCenter[1] = app.pillY;
-    constants.pillSize[0] = app.pillW;
-    constants.pillSize[1] = app.pillH;
+    constants.pillCenter[0] = app.visualPillX;
+    constants.pillCenter[1] = app.visualPillY;
+    constants.pillSize[0] = app.visualPillW;
+    constants.pillSize[1] = app.visualPillH;
+    constants.gooAmount = app.sideGooAmount;
+    constants.edgeDockSide = static_cast<float>(app.sideGooSide);
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fullRedraw ? app.clearPipeline : app.loadPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineLayout, 0, 1, &app.descriptorSet, 0, nullptr);
@@ -1274,13 +1508,23 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     AppState* app = g_app;
     switch (message) {
     case WM_ERASEBKGND:
+        if (app && !app->vulkanReady) {
+            RECT client{};
+            GetClientRect(window, &client);
+            FillRect(reinterpret_cast<HDC>(wParam), &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        }
         return 1;
     case WM_PAINT:
         if (app) {
             PAINTSTRUCT paint{};
-            BeginPaint(window, &paint);
+            HDC dc = BeginPaint(window, &paint);
+            if (!app->vulkanReady) {
+                FillRect(dc, &paint.rcPaint, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            }
             EndPaint(window, &paint);
-            InvalidateFull(*app);
+            if (app->vulkanReady) {
+                InvalidateFull(*app);
+            }
         }
         return 0;
     case WM_SIZE:
@@ -1319,9 +1563,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             const VkRect2D previous = PillRect(*app);
             const float x = static_cast<float>(GET_X_LPARAM(lParam));
             const float y = static_cast<float>(GET_Y_LPARAM(lParam));
-            app->pillX = x - app->dragOffsetX;
-            app->pillY = y - app->dragOffsetY;
-            ClampPill(*app);
+            UpdateDraggedPill(*app, x, y);
             InvalidatePill(*app, previous);
         }
         return 0;
@@ -1356,6 +1598,7 @@ void CreateWindowForApp(AppState& app, HINSTANCE instance, int showCommand) {
     wc.hInstance = instance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     wc.lpszClassName = "LiquidGlassPillVulkanWindow";
     if (!RegisterClassA(&wc)) {
         throw std::runtime_error("Could not register Win32 window class.");
@@ -1403,6 +1646,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
     try {
         CreateWindowForApp(app, instance, showCommand);
         InitVulkan(app, instance);
+        app.vulkanReady = true;
+        InvalidateFull(app);
 
         MSG message{};
         while (app.running) {
@@ -1419,6 +1664,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
                 WaitMessage();
                 continue;
             }
+            UpdatePillTransition(app);
             if (app.needsRedraw) {
                 DrawFrame(app);
             } else {
