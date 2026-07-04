@@ -1,14 +1,20 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <windows.h>
 #include <windowsx.h>
+#include <dwmapi.h>
+#include <shellapi.h>
 #include <objbase.h>
 #include <wincodec.h>
 #include <vulkan/vulkan.h>
+
+#include "desktop_overlay.h"
+#include "liquid_glass_shared.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -16,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -27,7 +34,17 @@ constexpr float kPillTransitionResponsiveness = 9.25f;
 constexpr float kPillTransitionSnapEpsilon = 0.35f;
 constexpr float kGooDecayResponsiveness = 3.85f;
 constexpr float kGooSnapEpsilon = 0.015f;
-constexpr wchar_t kBackgroundImagePath[] = L"C:\\Users\\jluiz\\Desktop\\Newspaper.png";
+constexpr int kToggleButtonWidth = 128;
+constexpr int kToggleButtonHeight = 44;
+constexpr int kToggleButtonMargin = 18;
+constexpr UINT kTrayCallbackMessage = WM_APP + 1;
+constexpr UINT kTrayIconId = 1;
+constexpr UINT kTrayShowCommand = 1001;
+constexpr UINT kTrayExitCommand = 1002;
+constexpr int kDesktopHotkeyId = 2001;
+constexpr UINT kDesktopHotkeyModifiers = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
+constexpr UINT kDesktopHotkeyKey = 'P';
+constexpr wchar_t kBackgroundImagePath[] = L"assets\\Newspaper.png";
 
 struct ImagePixels {
     std::vector<std::uint8_t> rgba;
@@ -35,15 +52,7 @@ struct ImagePixels {
     std::uint32_t height = 0;
 };
 
-struct PushConstants {
-    float resolution[2];
-    float time;
-    float dragging;
-    float pillCenter[2];
-    float pillSize[2];
-    float gooAmount;
-    float edgeDockSide;
-};
+using PushConstants = LiquidGlassPushConstants;
 
 struct QueueFamilyIndices {
     std::optional<std::uint32_t> graphicsFamily;
@@ -62,6 +71,7 @@ struct SwapchainSupport {
 
 struct AppState {
     HWND window = nullptr;
+    HINSTANCE instanceHandle = nullptr;
     int width = kInitialWidth;
     int height = kInitialHeight;
     bool minimized = false;
@@ -70,6 +80,17 @@ struct AppState {
     bool forceFullRedraw = true;
     bool running = true;
     bool vulkanReady = false;
+    bool desktopMode = false;
+    bool externalMemoryWin32Enabled = false;
+    bool keyedMutexEnabled = false;
+    bool trayIconAdded = false;
+    bool desktopHotkeyRegistered = false;
+    DesktopOverlay* desktopOverlay = nullptr;
+    DWORD normalStyle = 0;
+    DWORD normalExStyle = 0;
+    RECT normalWindowRect{};
+    WINDOWPLACEMENT normalPlacement{};
+    bool normalPlacementValid = false;
 
     float pillX = kInitialWidth * 0.5f;
     float pillY = kInitialHeight * 0.52f;
@@ -132,9 +153,15 @@ struct AppState {
     VkDeviceMemory backgroundMemory = VK_NULL_HANDLE;
     VkImageView backgroundImageView = VK_NULL_HANDLE;
     VkSampler backgroundSampler = VK_NULL_HANDLE;
+
 };
 
 AppState* g_app = nullptr;
+
+void AddTrayIcon(AppState& app);
+void RemoveTrayIcon(AppState& app);
+void RegisterGlobalHotkeys(AppState& app);
+void UnregisterGlobalHotkeys(AppState& app);
 
 float Clamp01(float value) {
     return std::clamp(value, 0.0f, 1.0f);
@@ -171,6 +198,27 @@ std::wstring ExeDirectory() {
     std::wstring result(path.data(), length);
     const size_t slash = result.find_last_of(L"\\/");
     return slash == std::wstring::npos ? L"." : result.substr(0, slash);
+}
+
+std::string LowerAscii(const char* text) {
+    std::string value = text ? text : "";
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool HasCommandLineSwitch(const std::string& commandLine, const char* name) {
+    return commandLine.find(name) != std::string::npos;
+}
+
+bool ShouldStartInDesktopMode(LPSTR commandLine) {
+    const std::string flags = LowerAscii(commandLine);
+    if (HasCommandLineSwitch(flags, "--window") || HasCommandLineSwitch(flags, "--app") ||
+        HasCommandLineSwitch(flags, "/window") || HasCommandLineSwitch(flags, "/app")) {
+        return false;
+    }
+    return true;
 }
 
 void CheckVk(VkResult result, const char* message) {
@@ -216,13 +264,24 @@ struct ComPtr {
     ComPtr() = default;
 
     ~ComPtr() {
-        if (ptr) {
-            ptr->Release();
-        }
+        Reset();
     }
 
     ComPtr(const ComPtr&) = delete;
     ComPtr& operator=(const ComPtr&) = delete;
+
+    ComPtr(ComPtr&& other) noexcept : ptr(other.ptr) {
+        other.ptr = nullptr;
+    }
+
+    ComPtr& operator=(ComPtr&& other) noexcept {
+        if (this != &other) {
+            Reset();
+            ptr = other.ptr;
+            other.ptr = nullptr;
+        }
+        return *this;
+    }
 
     T* Get() const {
         return ptr;
@@ -232,8 +291,24 @@ struct ComPtr {
         return &ptr;
     }
 
+    T** ReleaseAndGetAddressOf() {
+        Reset();
+        return &ptr;
+    }
+
+    void Reset(T* value = nullptr) {
+        if (ptr) {
+            ptr->Release();
+        }
+        ptr = value;
+    }
+
     T* operator->() const {
         return ptr;
+    }
+
+    explicit operator bool() const {
+        return ptr != nullptr;
     }
 };
 
@@ -249,7 +324,7 @@ ImagePixels LoadBackgroundPixels() {
     ComPtr<IWICBitmapDecoder> decoder;
     CheckHr(
         factory->CreateDecoderFromFilename(kBackgroundImagePath, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, decoder.GetAddressOf()),
-        "Could not open C:\\Users\\jluiz\\Desktop\\Newspaper.png.");
+        "Could not open assets\\Newspaper.png.");
 
     ComPtr<IWICBitmapFrameDecode> frame;
     CheckHr(decoder->GetFrame(0, frame.GetAddressOf()), "Could not decode the first frame of Newspaper.png.");
@@ -300,6 +375,20 @@ bool HitPill(const AppState& app, float x, float y) {
     return PillSdf(app, x, y) <= 0.0f;
 }
 
+RECT ToggleButtonBounds(const AppState& app) {
+    const int width = std::min(kToggleButtonWidth, std::max(app.width - kToggleButtonMargin * 2, 1));
+    const int height = std::min(kToggleButtonHeight, std::max(app.height - kToggleButtonMargin * 2, 1));
+    const int left = std::max(kToggleButtonMargin, app.width - width - kToggleButtonMargin);
+    const int top = kToggleButtonMargin;
+    return {left, top, left + width, top + height};
+}
+
+bool HitToggleButton(const AppState& app, float x, float y) {
+    const RECT button = ToggleButtonBounds(app);
+    return x >= static_cast<float>(button.left) && x <= static_cast<float>(button.right) &&
+           y >= static_cast<float>(button.top) && y <= static_cast<float>(button.bottom);
+}
+
 float PillVisualDelta(const AppState& app) {
     const float positionDelta = std::max(std::fabs(app.visualPillX - app.pillX), std::fabs(app.visualPillY - app.pillY));
     const float sizeDelta = std::max(std::fabs(app.visualPillW - app.pillW), std::fabs(app.visualPillH - app.pillH));
@@ -342,6 +431,12 @@ void SetSideGoo(AppState& app, int side, float amount) {
     app.sideGooAmount = Clamp01(amount);
     app.pillAnimationUpdatedAt = std::chrono::steady_clock::now();
     app.needsRedraw = true;
+}
+
+void FlushDesktopComposition() {
+    if (FAILED(DwmFlush())) {
+        Sleep(16);
+    }
 }
 
 void ApplyPillOrientation(AppState& app) {
@@ -625,17 +720,21 @@ SwapchainSupport QuerySwapchainSupport(VkPhysicalDevice device, VkSurfaceKHR sur
     return support;
 }
 
-bool DeviceSupportsSwapchain(VkPhysicalDevice device) {
+bool DeviceSupportsExtension(VkPhysicalDevice device, const char* requiredExtension) {
     std::uint32_t extensionCount = 0;
     vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, nullptr);
     std::vector<VkExtensionProperties> extensions(extensionCount);
     vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, extensions.data());
     for (const auto& extension : extensions) {
-        if (std::strcmp(extension.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
+        if (std::strcmp(extension.extensionName, requiredExtension) == 0) {
             return true;
         }
     }
     return false;
+}
+
+bool DeviceSupportsSwapchain(VkPhysicalDevice device) {
+    return DeviceSupportsExtension(device, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 }
 
 VkSurfaceFormatKHR ChooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats) {
@@ -667,6 +766,20 @@ VkExtent2D ChooseExtent(const VkSurfaceCapabilitiesKHR& capabilities, const AppS
     extent.width = std::clamp(extent.width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width);
     extent.height = std::clamp(extent.height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
     return extent;
+}
+
+VkCompositeAlphaFlagBitsKHR ChooseCompositeAlpha(const VkSurfaceCapabilitiesKHR& capabilities, const AppState& app) {
+    (void)app;
+    if ((capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0) {
+        return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    }
+    if ((capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) != 0) {
+        return VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    }
+    if ((capabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) != 0) {
+        return VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+    }
+    return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 }
 
 std::uint32_t FindMemoryType(AppState& app, std::uint32_t typeFilter, VkMemoryPropertyFlags properties) {
@@ -915,12 +1028,25 @@ void CreateLogicalDevice(AppState& app) {
         queueCreateInfos.push_back(queueInfo);
     }
 
-    const char* extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    app.externalMemoryWin32Enabled =
+        DeviceSupportsExtension(app.physicalDevice, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME) &&
+        DeviceSupportsExtension(app.physicalDevice, VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+    app.keyedMutexEnabled = DeviceSupportsExtension(app.physicalDevice, VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME);
+    if (app.externalMemoryWin32Enabled && app.keyedMutexEnabled) {
+        extensions.push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+        extensions.push_back(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+        extensions.push_back(VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME);
+    } else {
+        app.externalMemoryWin32Enabled = false;
+        app.keyedMutexEnabled = false;
+    }
+
     VkDeviceCreateInfo createInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     createInfo.queueCreateInfoCount = static_cast<std::uint32_t>(queueCreateInfos.size());
     createInfo.pQueueCreateInfos = queueCreateInfos.data();
-    createInfo.enabledExtensionCount = static_cast<std::uint32_t>(std::size(extensions));
-    createInfo.ppEnabledExtensionNames = extensions;
+    createInfo.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
+    createInfo.ppEnabledExtensionNames = extensions.data();
     CheckVk(vkCreateDevice(app.physicalDevice, &createInfo, nullptr, &app.device), "Could not create Vulkan logical device.");
 
     vkGetDeviceQueue(app.device, *app.queueFamilies.graphicsFamily, 0, &app.graphicsQueue);
@@ -961,7 +1087,7 @@ void CreateSwapchain(AppState& app) {
     }
 
     createInfo.preTransform = support.capabilities.currentTransform;
-    createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    createInfo.compositeAlpha = ChooseCompositeAlpha(support.capabilities, app);
     createInfo.presentMode = presentMode;
     createInfo.clipped = VK_TRUE;
 
@@ -1051,7 +1177,13 @@ void CreateDescriptorSetLayout(AppState& app) {
     CheckVk(vkCreateDescriptorSetLayout(app.device, &layoutInfo, nullptr, &app.descriptorSetLayout), "Could not create Vulkan descriptor layout.");
 }
 
-VkPipeline CreatePipelineForRenderPass(AppState& app, VkRenderPass renderPass, const std::vector<char>& vertCode, const std::vector<char>& fragCode) {
+VkPipeline CreatePipelineForRenderPass(
+    AppState& app,
+    VkRenderPass renderPass,
+    const std::vector<char>& vertCode,
+    const std::vector<char>& fragCode,
+    VkColorComponentFlags colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    bool multiplyRgbByDstAlpha = false) {
     VkShaderModule vertModule = CreateShaderModule(app, vertCode);
     VkShaderModule fragModule = CreateShaderModule(app, fragCode);
 
@@ -1084,7 +1216,16 @@ VkPipeline CreatePipelineForRenderPass(AppState& app, VkRenderPass renderPass, c
     multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
     VkPipelineColorBlendAttachmentState colorBlendAttachment{};
-    colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    colorBlendAttachment.colorWriteMask = colorWriteMask;
+    if (multiplyRgbByDstAlpha) {
+        colorBlendAttachment.blendEnable = VK_TRUE;
+        colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_DST_ALPHA;
+        colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+        colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
 
     VkPipelineColorBlendStateCreateInfo colorBlending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     colorBlending.attachmentCount = 1;
@@ -1293,7 +1434,11 @@ void RecordCommandBuffer(AppState& app, VkCommandBuffer commandBuffer, std::uint
     CheckVk(vkBeginCommandBuffer(commandBuffer, &beginInfo), "Could not begin Vulkan command buffer.");
 
     VkClearValue clearColor{};
-    clearColor.color = {{0.02f, 0.04f, 0.05f, 1.0f}};
+    if (app.desktopMode) {
+        clearColor.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    } else {
+        clearColor.color = {{0.02f, 0.04f, 0.05f, 1.0f}};
+    }
 
     VkRenderPassBeginInfo renderPassInfo{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     renderPassInfo.renderPass = fullRedraw ? app.clearRenderPass : app.loadRenderPass;
@@ -1326,6 +1471,12 @@ void RecordCommandBuffer(AppState& app, VkCommandBuffer commandBuffer, std::uint
     constants.pillSize[1] = app.visualPillH;
     constants.gooAmount = app.sideGooAmount;
     constants.edgeDockSide = static_cast<float>(app.sideGooSide);
+    constants.desktopMode = app.desktopMode ? 1.0f : 0.0f;
+    const RECT button = ToggleButtonBounds(app);
+    constants.buttonCenterX = (static_cast<float>(button.left) + static_cast<float>(button.right)) * 0.5f;
+    constants.buttonCenterY = (static_cast<float>(button.top) + static_cast<float>(button.bottom)) * 0.5f;
+    constants.buttonWidth = static_cast<float>(button.right - button.left);
+    constants.buttonHeight = static_cast<float>(button.bottom - button.top);
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fullRedraw ? app.clearPipeline : app.loadPipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app.pipelineLayout, 0, 1, &app.descriptorSet, 0, nullptr);
@@ -1420,6 +1571,13 @@ void InitVulkan(AppState& app, HINSTANCE instanceHandle) {
 }
 
 void Cleanup(AppState& app) {
+    UnregisterGlobalHotkeys(app);
+    RemoveTrayIcon(app);
+    if (app.desktopOverlay) {
+        app.desktopOverlay->Stop();
+        delete app.desktopOverlay;
+        app.desktopOverlay = nullptr;
+    }
     if (app.device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(app.device);
         CleanupSwapchain(app);
@@ -1465,9 +1623,212 @@ void Cleanup(AppState& app) {
     }
 }
 
+POINT PillScreenCenter(const AppState& app) {
+    if (app.desktopMode && app.desktopOverlay) {
+        return app.desktopOverlay->CenterScreenPoint();
+    }
+
+    POINT center{
+        static_cast<LONG>(std::lround(app.pillX)),
+        static_cast<LONG>(std::lround(app.pillY)),
+    };
+    ClientToScreen(app.window, &center);
+    return center;
+}
+
+void AddTrayIcon(AppState& app) {
+    if (app.trayIconAdded || !app.window) {
+        return;
+    }
+
+    NOTIFYICONDATAA data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = app.window;
+    data.uID = kTrayIconId;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = kTrayCallbackMessage;
+    data.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    lstrcpynA(data.szTip, "Liquid Glass Pill is running in desktop mode", static_cast<int>(sizeof(data.szTip)));
+    if (Shell_NotifyIconA(NIM_ADD, &data)) {
+        data.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconA(NIM_SETVERSION, &data);
+        app.trayIconAdded = true;
+    }
+}
+
+void RemoveTrayIcon(AppState& app) {
+    if (!app.trayIconAdded || !app.window) {
+        return;
+    }
+
+    NOTIFYICONDATAA data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = app.window;
+    data.uID = kTrayIconId;
+    Shell_NotifyIconA(NIM_DELETE, &data);
+    app.trayIconAdded = false;
+}
+
+void RegisterGlobalHotkeys(AppState& app) {
+    if (!app.window || app.desktopHotkeyRegistered) {
+        return;
+    }
+    app.desktopHotkeyRegistered = RegisterHotKey(app.window, kDesktopHotkeyId, kDesktopHotkeyModifiers, kDesktopHotkeyKey) != FALSE;
+}
+
+void UnregisterGlobalHotkeys(AppState& app) {
+    if (!app.desktopHotkeyRegistered || !app.window) {
+        return;
+    }
+    UnregisterHotKey(app.window, kDesktopHotkeyId);
+    app.desktopHotkeyRegistered = false;
+}
+
+void ShowTrayMenu(AppState& app) {
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    HMENU menu = CreatePopupMenu();
+    if (!menu) {
+        return;
+    }
+
+    AppendMenuA(menu, MF_STRING, kTrayShowCommand, "Show app");
+    AppendMenuA(menu, MF_STRING, kTrayExitCommand, "Exit");
+    SetForegroundWindow(app.window);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, cursor.x, cursor.y, 0, app.window, nullptr);
+    DestroyMenu(menu);
+}
+
+void SetDesktopMode(AppState& app, bool enabled) {
+    if (!app.window || app.desktopMode == enabled) {
+        return;
+    }
+
+    if (app.dragging) {
+        app.dragging = false;
+        if (GetCapture() == app.window) {
+            ReleaseCapture();
+        }
+    }
+
+    POINT screenCenter = PillScreenCenter(app);
+
+    if (enabled) {
+        app.normalPlacement = {};
+        app.normalPlacement.length = sizeof(WINDOWPLACEMENT);
+        app.normalPlacementValid = GetWindowPlacement(app.window, &app.normalPlacement) != FALSE;
+        GetWindowRect(app.window, &app.normalWindowRect);
+
+        DesktopOverlayVulkanContext overlayContext{};
+        overlayContext.instanceHandle = app.instanceHandle;
+        overlayContext.instance = app.instance;
+        overlayContext.physicalDevice = app.physicalDevice;
+        overlayContext.device = app.device;
+        overlayContext.graphicsQueue = app.graphicsQueue;
+        overlayContext.presentQueue = app.presentQueue;
+        overlayContext.graphicsFamily = *app.queueFamilies.graphicsFamily;
+        overlayContext.presentFamily = *app.queueFamilies.presentFamily;
+        overlayContext.externalMemoryWin32Enabled = app.externalMemoryWin32Enabled;
+        overlayContext.keyedMutexEnabled = app.keyedMutexEnabled;
+        overlayContext.shaderDirectory = ExeDirectory() + L"\\shaders";
+
+        ShowWindow(app.window, SW_HIDE);
+        FlushDesktopComposition();
+
+        DesktopOverlay* overlay = new DesktopOverlay();
+        if (!overlay->Start(overlayContext, screenCenter)) {
+            const std::string error = overlay->lastError().empty()
+                                          ? "The standalone desktop overlay could not start."
+                                          : overlay->lastError();
+            delete overlay;
+            ShowWindow(app.window, SW_SHOW);
+            FlushDesktopComposition();
+            ShowError("Desktop overlay did not start:\n" + error);
+            return;
+        }
+        app.desktopOverlay = overlay;
+        app.desktopMode = true;
+        AddTrayIcon(app);
+    } else {
+        if (app.desktopOverlay) {
+            app.desktopOverlay->Stop();
+            delete app.desktopOverlay;
+            app.desktopOverlay = nullptr;
+        }
+        RemoveTrayIcon(app);
+        app.desktopMode = false;
+        SetWindowPos(
+            app.window,
+            HWND_NOTOPMOST,
+            app.normalWindowRect.left,
+            app.normalWindowRect.top,
+            app.normalWindowRect.right - app.normalWindowRect.left,
+            app.normalWindowRect.bottom - app.normalWindowRect.top,
+            SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        ShowWindow(app.window, SW_SHOW);
+        if (app.normalPlacementValid) {
+            app.normalPlacement.length = sizeof(WINDOWPLACEMENT);
+            SetWindowPlacement(app.window, &app.normalPlacement);
+        }
+
+        RECT client{};
+        GetClientRect(app.window, &client);
+        ResizePill(app, client.right - client.left, client.bottom - client.top);
+
+        POINT clientCenter = screenCenter;
+        ScreenToClient(app.window, &clientCenter);
+        app.pillX = static_cast<float>(clientCenter.x);
+        app.pillY = static_cast<float>(clientCenter.y);
+        ClampPill(app);
+        SyncPillVisualToTarget(app);
+    }
+
+    SetWindowTextA(app.window, app.desktopMode ? "Liquid Glass Pill - Desktop Mode" : "Liquid Glass Pill - C++ Vulkan");
+    InvalidateFull(app);
+}
+
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     AppState* app = g_app;
     switch (message) {
+    case kTrayCallbackMessage:
+        if (app) {
+            if (LOWORD(lParam) == WM_CONTEXTMENU || LOWORD(lParam) == WM_RBUTTONUP) {
+                ShowTrayMenu(*app);
+                return 0;
+            }
+            if (LOWORD(lParam) == NIN_SELECT || LOWORD(lParam) == WM_LBUTTONDBLCLK) {
+                SetDesktopMode(*app, false);
+                return 0;
+            }
+        }
+        return 0;
+    case WM_HOTKEY:
+        if (app && wParam == kDesktopHotkeyId) {
+            SetDesktopMode(*app, !app->desktopMode);
+            return 0;
+        }
+        break;
+    case WM_COMMAND:
+        if (app) {
+            switch (LOWORD(wParam)) {
+            case kTrayShowCommand:
+                SetDesktopMode(*app, false);
+                return 0;
+            case kTrayExitCommand:
+                app->running = false;
+                RemoveTrayIcon(*app);
+                if (app->desktopOverlay) {
+                    app->desktopOverlay->Stop();
+                    delete app->desktopOverlay;
+                    app->desktopOverlay = nullptr;
+                }
+                DestroyWindow(window);
+                return 0;
+            default:
+                break;
+            }
+        }
+        break;
     case WM_ERASEBKGND:
         if (app && !app->vulkanReady) {
             RECT client{};
@@ -1489,8 +1850,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         return 0;
     case WM_SIZE:
-        if (app) {
+        if (app && !app->desktopMode) {
             ResizePill(*app, LOWORD(lParam), HIWORD(lParam));
+        }
+        return 0;
+    case WM_DISPLAYCHANGE:
+        if (app && app->desktopMode && app->desktopOverlay) {
+            app->desktopOverlay->OnDisplayChanged();
         }
         return 0;
     case WM_SETCURSOR:
@@ -1498,16 +1864,28 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             POINT point;
             GetCursorPos(&point);
             ScreenToClient(window, &point);
-            if (app->dragging || HitPill(*app, static_cast<float>(point.x), static_cast<float>(point.y))) {
+            if (app->dragging ||
+                HitPill(*app, static_cast<float>(point.x), static_cast<float>(point.y)) ||
+                HitToggleButton(*app, static_cast<float>(point.x), static_cast<float>(point.y))) {
                 SetCursor(LoadCursor(nullptr, IDC_HAND));
                 return TRUE;
             }
+        }
+        break;
+    case WM_KEYDOWN:
+        if (app && app->desktopMode && wParam == VK_ESCAPE) {
+            SetDesktopMode(*app, false);
+            return 0;
         }
         break;
     case WM_LBUTTONDOWN:
         if (app) {
             const float x = static_cast<float>(GET_X_LPARAM(lParam));
             const float y = static_cast<float>(GET_Y_LPARAM(lParam));
+            if (HitToggleButton(*app, x, y)) {
+                SetDesktopMode(*app, !app->desktopMode);
+                return 0;
+            }
             if (HitPill(*app, x, y)) {
                 const VkRect2D previous = PillRect(*app);
                 app->dragging = true;
@@ -1597,18 +1975,26 @@ void CreateWindowForApp(AppState& app, HINSTANCE instance, int showCommand) {
 
 } // namespace
 
-int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR commandLine, int showCommand) {
     SetProcessDPIAware();
+
+    const bool startInDesktopMode = ShouldStartInDesktopMode(commandLine);
 
     AppState app;
     g_app = &app;
+    app.instanceHandle = instance;
     app.startedAt = std::chrono::steady_clock::now();
 
     try {
         CreateWindowForApp(app, instance, showCommand);
+        RegisterGlobalHotkeys(app);
         InitVulkan(app, instance);
         app.vulkanReady = true;
-        InvalidateFull(app);
+        if (startInDesktopMode) {
+            SetDesktopMode(app, true);
+        } else {
+            InvalidateFull(app);
+        }
 
         MSG message{};
         while (app.running) {
@@ -1619,6 +2005,15 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
                 }
                 TranslateMessage(&message);
                 DispatchMessageA(&message);
+            }
+
+            if (app.desktopMode) {
+                if (!app.desktopOverlay || app.desktopOverlay->restoreRequested() || !app.desktopOverlay->Tick()) {
+                    SetDesktopMode(app, false);
+                    continue;
+                }
+                Sleep(8);
+                continue;
             }
 
             if (app.minimized) {

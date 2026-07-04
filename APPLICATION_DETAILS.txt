@@ -1,0 +1,92 @@
+Liquid Glass Pill - Application Details
+=======================================
+
+Project path
+------------
+C:\Users\jluiz\Desktop\test3
+
+Built executable
+----------------
+C:\Users\jluiz\Desktop\test3\build\LiquidGlassPill.exe
+
+Summary
+-------
+Liquid Glass Pill is a native Windows C++17 application that now starts as a
+system-wide desktop overlay by default, with the normal app window still
+available from the tray or by launching with `--window`. It has two separate
+surfaces:
+
+1. Normal in-app mode
+   The main Win32 window renders the existing in-app Liquid Glass pill with
+   Vulkan and `shaders\liquid.frag`.
+
+2. Standalone desktop overlay mode
+   `DesktopOverlay` starts an independent transparent Win32 overlay, captures
+   the live desktop through DXGI Desktop Duplication into a D3D11 GPU texture,
+   imports that shared texture into Vulkan, and renders the pill with the
+   overlay variant of the Liquid Glass shader.
+
+Runtime behavior
+----------------
+Default launch:
+
+LiquidGlassPill.exe
+
+This starts directly in the standalone desktop overlay. The main app window is
+hidden, the tray icon exposes "Show app" and "Exit", and `Ctrl+Alt+P` toggles
+between the desktop pill and the normal app window when the global hotkey is
+available.
+
+Windowed launch:
+
+LiquidGlassPill.exe --window
+
+This opens the normal in-app demo window first. `--app`, `/window`, and `/app`
+are accepted aliases for the same behavior.
+
+Architecture
+------------
+The standalone Floating Pill implementation is split by responsibility:
+
+- `DesktopOverlay`
+  Owns desktop-mode lifecycle, first-frame validation, display-change handling,
+  and restore requests back to the main app.
+
+- `OverlayWindow`
+  Creates the topmost no-activate Win32 overlay window, applies a pill-shaped
+  region, and forwards drag input to the desktop pill controller.
+
+- `BackgroundProvider`
+  Captures the desktop with DXGI Desktop Duplication and writes it into a
+  shared D3D11 atlas texture. It does not render UI.
+
+- `VulkanRenderer`
+  Imports the shared D3D11 texture with Vulkan external memory, synchronizes it
+  with a Win32 keyed mutex, and renders the transparent overlay swapchain.
+
+- `OverlayPillController`
+  Owns only desktop pill geometry, dragging, docking, goo animation, hit tests,
+  and the 0.88 desktop scale.
+
+Rendering pipeline
+------------------
+Desktop -> DXGI Desktop Duplication -> ID3D11Texture2D shared atlas ->
+Vulkan imported VkImage -> `overlay.frag.spv` -> premultiplied-alpha Vulkan
+overlay swapchain.
+
+The desktop overlay does not use GDI screen capture, BitBlt, UpdateLayeredWindow,
+CPU screenshots, CPU pixel processing, or a CPU Liquid Glass approximation.
+
+Build commands
+--------------
+Recommended direct build:
+
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+
+CMake build, when a generator is available:
+
+cmake -S . -B build -G "MinGW Makefiles"
+cmake --build build
+
+On this machine, `build.ps1` is the reliable default because the expected
+`mingw32-make.exe` is not installed.

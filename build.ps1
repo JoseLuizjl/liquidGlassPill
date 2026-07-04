@@ -28,6 +28,7 @@ function Invoke-Checked {
 
 Invoke-Checked $Glslang @("-V", (Join-Path $PSScriptRoot "shaders\liquid.vert"), "-o", (Join-Path $ShaderBuildDir "liquid.vert.spv"))
 Invoke-Checked $Glslang @("-V", (Join-Path $PSScriptRoot "shaders\liquid.frag"), "-o", (Join-Path $ShaderBuildDir "liquid.frag.spv"))
+Invoke-Checked $Glslang @("-V", "-DDESKTOP_OVERLAY=1", (Join-Path $PSScriptRoot "shaders\liquid.frag"), "-o", (Join-Path $ShaderBuildDir "overlay.frag.spv"))
 
 Invoke-Checked $Compiler @(
     "-std=c++17",
@@ -42,12 +43,18 @@ Invoke-Checked $Compiler @(
     "-DNOMINMAX",
     "-mwindows",
     (Join-Path $PSScriptRoot "src\main.cpp"),
+    (Join-Path $PSScriptRoot "src\desktop_overlay.cpp"),
+    (Join-Path $PSScriptRoot "src\overlay_pill_controller.cpp"),
     (Join-Path $VulkanSdk "Lib\vulkan-1.lib"),
     "-lgdi32",
     "-luser32",
+    "-lshell32",
     "-lole32",
     "-lwindowscodecs",
     "-luuid",
+    "-ldwmapi",
+    "-ld3d11",
+    "-ldxgi",
     "-o",
     $Output
 )

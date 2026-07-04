@@ -10,6 +10,11 @@ layout(push_constant) uniform PushConstants {
     vec2 pillSize;
     float gooAmount;
     float edgeDockSide;
+    float desktopMode;
+    float buttonCenterX;
+    float buttonCenterY;
+    float buttonWidth;
+    float buttonHeight;
 } pc;
 
 layout(location = 0) in vec2 v_uv;
@@ -126,6 +131,22 @@ float smoothstepAny(float edge0, float edge1, float value) {
     return t * t * (3.0 - 2.0 * t);
 }
 
+float roundedBoxSdf(vec2 p, vec2 center, vec2 size, float radius) {
+    vec2 q = abs(p - center) - size * 0.5 + vec2(radius);
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - radius;
+}
+
+float lineSegmentDistance(vec2 p, vec2 a, vec2 b) {
+    vec2 pa = p - a;
+    vec2 ba = b - a;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+float lineMask(vec2 p, vec2 a, vec2 b, float width) {
+    return 1.0 - smoothstep(width, width + 1.4, lineSegmentDistance(p, a, b));
+}
+
 float liquidGlow(vec2 local) {
     return sin(atan(local.y, local.x) - 0.5);
 }
@@ -201,13 +222,66 @@ vec3 liquidGlass(vec2 p, float d) {
     return clamp(glass, 0.0, 1.0);
 }
 
+vec3 desktopGlass(vec2 p, float d) {
+    vec2 rel = (p - pc.pillCenter) / pc.pillSize;
+    vec2 g = pillGradient(p);
+    float shortSide = min(pc.pillSize.x, pc.pillSize.y);
+    float dist = clamp(max(-d, 0.0) / (shortSide * 0.50), 0.0, 1.35);
+    float rim = 1.0 - smoothstep(0.0, 0.40, dist);
+    float rimPower = rim * rim;
+    float surface = 0.66 + 0.12 * waveNoise(p * 0.14 + rel * 9.0);
+
+    vec3 glass = vec3(0.62, 0.78, 0.88) * surface;
+    glass = mix(glass, vec3(0.94, 0.98, 1.0), rim * 0.34);
+
+    vec3 n3 = normalize(vec3(g * (0.52 + rim * 0.62), 0.88 - rim * 0.12));
+    vec3 light = normalize(vec3(-0.45, -0.72, 1.0));
+    float spec = pow(max(dot(n3, normalize(light + vec3(0.0, 0.0, 1.0))), 0.0), 74.0);
+    glass += vec3(1.0) * spec * (0.08 + rimPower * 0.28);
+    glass += vec3(0.72, 0.94, 1.0) * rim * 0.10;
+    glass -= vec3(0.02, 0.03, 0.04) * smoothstep(-0.20, 0.72, rel.y) * 0.22;
+    return clamp(glass, 0.0, 1.0);
+}
+
+float drawOsIcon(vec2 p, vec2 center) {
+    vec2 o = (p - (center + vec2(-18.0, 0.0))) / vec2(9.5, 11.5);
+    float letterO = 1.0 - smoothstep(0.055, 0.150, abs(length(o) - 1.0));
+
+    vec2 s = p - (center + vec2(15.0, 0.0));
+    float letterS = 0.0;
+    letterS = max(letterS, lineMask(s, vec2(-9.0, -10.5), vec2(8.0, -10.5), 2.0));
+    letterS = max(letterS, lineMask(s, vec2(-9.0, 0.0), vec2(8.0, 0.0), 2.0));
+    letterS = max(letterS, lineMask(s, vec2(-9.0, 10.5), vec2(8.0, 10.5), 2.0));
+    letterS = max(letterS, lineMask(s, vec2(-9.0, -10.5), vec2(-9.0, 0.0), 2.0));
+    letterS = max(letterS, lineMask(s, vec2(8.0, 0.0), vec2(8.0, 10.5), 2.0));
+    return max(letterO, letterS);
+}
+
+vec4 overlayButton(vec2 p) {
+    vec2 center = vec2(pc.buttonCenterX, pc.buttonCenterY);
+    vec2 size = vec2(pc.buttonWidth, pc.buttonHeight);
+    float d = roundedBoxSdf(p, center, size, min(size.y * 0.50, 22.0));
+    float fill = 1.0 - smoothstep(0.0, 1.5, d);
+    float rim = 1.0 - smoothstep(0.0, 1.4, abs(d));
+    float glow = 1.0 - smoothstep(0.0, 12.0, abs(d + 5.0));
+    float activeMode = step(0.5, pc.desktopMode);
+
+    vec3 base = mix(vec3(0.88, 0.91, 0.93), vec3(0.72, 0.89, 1.0), activeMode);
+    vec3 edge = mix(vec3(1.0), vec3(0.75, 0.95, 1.0), activeMode);
+    vec3 color = base * (0.70 + 0.18 * smoothstep(-size.y * 0.35, size.y * 0.38, center.y - p.y));
+    color += edge * rim * 0.55;
+    color += vec3(0.35, 0.72, 1.0) * glow * (0.05 + activeMode * 0.10);
+
+    float icon = drawOsIcon(p, center);
+    vec3 iconColor = mix(vec3(0.12, 0.14, 0.16), vec3(0.02, 0.09, 0.13), activeMode);
+    color = mix(color, iconColor, icon * fill);
+    return vec4(clamp(color, 0.0, 1.0), max(fill * 0.88, rim * 0.72));
+}
+
+#ifdef DESKTOP_OVERLAY
 void main() {
     vec2 p = gl_FragCoord.xy;
     vec3 color = bg(p);
-
-    float shadowD = pillSdfAt(p - vec2(0.0, 17.0), pc.pillCenter, pc.pillSize, pc.gooAmount * 0.45, pc.edgeDockSide);
-    float shadow = (1.0 - smoothstep(0.0, 72.0, shadowD)) * smoothstep(-4.0, 13.0, shadowD);
-    color *= 1.0 - shadow * 0.18;
 
     float d = pillSdf(p);
     float inside = 1.0 - smoothstep(0.0, 1.4, d);
@@ -230,8 +304,61 @@ void main() {
     }
 
     float outline = 1.0 - smoothstep(0.0, 1.7, abs(d));
+    float blueEdge = 1.0 - smoothstep(0.0, 4.5, abs(d + 5.0));
     color += vec3(1.0) * outline * 0.36;
-    color += vec3(0.35, 0.72, 1.0) * (1.0 - smoothstep(0.0, 4.5, abs(d + 5.0))) * 0.045;
+    color += vec3(0.35, 0.72, 1.0) * blueEdge * 0.045;
 
-    outColor = vec4(pow(clamp(color, 0.0, 1.0), vec3(0.94)), 1.0);
+    float pillAlpha = clamp(inside * 0.48 + outline * 0.34 + blueEdge * 0.12, 0.0, 0.72);
+    vec3 encoded = pow(clamp(color, 0.0, 1.0), vec3(0.94)) * pillAlpha;
+    outColor = vec4(encoded, pillAlpha);
 }
+#else
+void main() {
+    vec2 p = gl_FragCoord.xy;
+    bool desktop = pc.desktopMode > 0.5;
+    vec3 color = desktop ? vec3(0.0) : bg(p);
+
+    float shadowD = pillSdfAt(p - vec2(0.0, 17.0), pc.pillCenter, pc.pillSize, pc.gooAmount * 0.45, pc.edgeDockSide);
+    float shadow = (1.0 - smoothstep(0.0, 72.0, shadowD)) * smoothstep(-4.0, 13.0, shadowD);
+    if (!desktop) {
+        color *= 1.0 - shadow * 0.18;
+    }
+
+    float d = pillSdf(p);
+    float inside = 1.0 - smoothstep(0.0, 1.4, d);
+    if (inside > 0.001) {
+        vec3 glass = desktop ? desktopGlass(p, d) : liquidGlass(p, d);
+        color = desktop ? mix(color, glass, inside) : mix(color, glass, inside * 0.76);
+
+        float dots = 0.0;
+        bool vertical = pc.pillSize.y > pc.pillSize.x;
+        float dotRadius = min(pc.pillSize.x, pc.pillSize.y) * 0.070;
+        for (int i = 0; i < 3; ++i) {
+            vec2 dotCenter = vertical
+                ? pc.pillCenter + vec2(0.0, pc.pillSize.y * 0.300 + float(i) * pc.pillSize.x * 0.205)
+                : pc.pillCenter + vec2(pc.pillSize.x * 0.300 + float(i) * pc.pillSize.y * 0.205, 0.0);
+            float dot = 1.0 - smoothstep(dotRadius, dotRadius + 1.6, length(p - dotCenter));
+            dots = max(dots, dot);
+        }
+        color = mix(color, vec3(0.045, 0.048, 0.052), dots * inside * 0.86);
+        color += dots * inside * vec3(0.025);
+    }
+
+    float outline = 1.0 - smoothstep(0.0, 1.7, abs(d));
+    float blueEdge = 1.0 - smoothstep(0.0, 4.5, abs(d + 5.0));
+    color += vec3(1.0) * outline * 0.36;
+    color += vec3(0.35, 0.72, 1.0) * blueEdge * 0.045;
+
+    vec4 button = overlayButton(p);
+    color = mix(color, button.rgb, button.a);
+
+    float pillAlpha = clamp(inside * 0.48 + outline * 0.34 + blueEdge * 0.12, 0.0, 0.72);
+    float alpha = desktop ? max(pillAlpha, button.a) : 1.0;
+    vec3 encoded = pow(clamp(color, 0.0, 1.0), vec3(0.94));
+    if (desktop) {
+        encoded *= alpha;
+    }
+
+    outColor = vec4(encoded, alpha);
+}
+#endif
